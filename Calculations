@@ -1,0 +1,584 @@
+# ============================================================
+# CHEM 124 LAB 3: NMR COFFEE METABOLOMICS
+# COMPLETE STATISTICAL ANALYSIS - BASE R ONLY
+# ============================================================
+
+# Select your CSV file
+input <- file.choose()
+
+# Create results folder
+output <- "NMR_Results"
+dir.create(output, showWarnings = FALSE, recursive = TRUE)
+
+# ============================================================
+# SECTION 1: IMPORT AND CLEAN NMR DATA
+# ============================================================
+
+raw <- read.csv(
+  input,
+  header = FALSE,
+  stringsAsFactors = FALSE,
+  col.names = c("Group", "Shift_ppm", "Height", "Width", "Area"),
+  fill = TRUE,
+  strip.white = TRUE
+)
+
+# Clean group labels
+raw$Group <- trimws(raw$Group)
+
+# Convert measurements to numeric
+for (v in c("Shift_ppm", "Height", "Width", "Area")) {
+  raw[[v]] <- suppressWarnings(as.numeric(raw[[v]]))
+}
+
+# Remove incomplete measurements
+d <- raw[
+  raw$Group %in% c("Arabica", "Robusta", "Unknown") &
+    complete.cases(raw[, c("Shift_ppm", "Height", "Width", "Area")]),
+]
+
+rownames(d) <- NULL
+
+cat("\nNUMBER OF VALID NMR PEAKS:\n")
+print(table(d$Group))
+
+# Save cleaned data
+write.csv(
+  d,
+  file.path(output, "01_Cleaned_Peak_List.csv"),
+  row.names = FALSE
+)
+
+# ============================================================
+# SECTION 2: DESCRIPTIVE STATISTICS
+# Mean, SD, SEM, %RSD, 95% confidence interval
+# ============================================================
+
+summ <- function(x) {
+
+  n <- length(x)
+  avg <- mean(x)
+
+  s <- if (n > 1) sd(x) else NA_real_
+  se <- s / sqrt(n)
+
+  tcrit <- if (n > 1) qt(0.975, n - 1) else NA_real_
+
+  c(
+    N = n,
+    Mean = avg,
+    SD = s,
+    SEM = se,
+    RSD_percent = if (avg != 0) 100 * s / abs(avg) else NA_real_,
+    CI95_low = avg - tcrit * se,
+    CI95_high = avg + tcrit * se
+  )
+}
+
+res <- do.call(
+  rbind,
+  lapply(split(d, d$Group), function(g) {
+
+    do.call(
+      rbind,
+      lapply(
+        c("Shift_ppm", "Height", "Width", "Area"),
+        function(v) {
+
+          data.frame(
+            Group = g$Group[1],
+            Variable = v,
+            t(summ(g[[v]])),
+            check.names = FALSE
+          )
+
+        }
+      )
+    )
+
+  })
+)
+
+cat("\nDESCRIPTIVE STATISTICS:\n")
+print(res)
+
+write.csv(
+  res,
+  file.path(output, "02_Descriptive_Statistics.csv"),
+  row.names = FALSE
+)
+
+# ============================================================
+# SECTION 3: CHEMICAL SHIFT BINNING
+# Sum peak areas in 0.1 ppm intervals
+# ============================================================
+
+bin_width <- 0.1
+
+edges <- seq(
+  floor(min(d$Shift_ppm) / bin_width) * bin_width,
+  ceiling(max(d$Shift_ppm) / bin_width) * bin_width + bin_width,
+  by = bin_width
+)
+
+d$Bin <- cut(
+  d$Shift_ppm,
+  breaks = edges,
+  include.lowest = TRUE,
+  right = FALSE
+)
+
+bins <- aggregate(
+  Area ~ Group + Bin,
+  data = d,
+  FUN = sum
+)
+
+cat("\nSUMMED PEAK AREAS BY CHEMICAL SHIFT:\n")
+print(head(bins, 20))
+
+write.csv(
+  bins,
+  file.path(output, "03_Summed_Area_by_Shift.csv"),
+  row.names = FALSE
+)
+
+# ============================================================
+# SECTION 4: NMR PEAK AREA PLOTS
+# ============================================================
+
+colors <- c(
+  Arabica = "red3",
+  Robusta = "forestgreen",
+  Unknown = "royalblue"
+)
+
+pdf(
+  file.path(output, "Figure1_NMR_Peak_Areas.pdf"),
+  width = 10,
+  height = 9
+)
+
+par(mfrow = c(3, 1), mar = c(4, 4, 3, 1))
+
+for (g in c("Arabica", "Robusta", "Unknown")) {
+
+  z <- d[d$Group == g, ]
+
+  plot(
+    z$Shift_ppm,
+    z$Area,
+    type = "h",
+    xlim = rev(range(d$Shift_ppm)),
+    main = paste(g, "NMR Peak Areas"),
+    xlab = "Chemical Shift (ppm)",
+    ylab = "Peak Area (a.u.)",
+    col = colors[g]
+  )
+
+}
+
+dev.off()
+
+# ============================================================
+# SECTION 5: COMPARE PEAK AREA DISTRIBUTIONS
+# Descriptive comparison only
+# ============================================================
+
+pdf(
+  file.path(output, "Figure2_Peak_Area_Comparison.pdf"),
+  width = 8,
+  height = 6
+)
+
+boxplot(
+  log1p(Area) ~ Group,
+  data = d,
+  col = colors[c("Arabica", "Robusta", "Unknown")],
+  main = "NMR Peak Area Distributions",
+  xlab = "Coffee Classification",
+  ylab = "log(1 + Peak Area)"
+)
+
+dev.off()
+
+# ============================================================
+# SECTION 6: SAMPLE-LEVEL PCA AND STATISTICAL TESTING
+# Requires independent SampleID values
+# ============================================================
+
+sample_file <- "NMR_Peaks_With_SampleID.csv"
+
+if (file.exists(sample_file)) {
+
+  s <- read.csv(
+    sample_file,
+    stringsAsFactors = FALSE
+  )
+
+  required <- c(
+    "Group",
+    "SampleID",
+    "Shift_ppm",
+    "Area"
+  )
+
+  stopifnot(all(required %in% names(s)))
+
+  s$Group <- trimws(s$Group)
+
+  s <- s[
+    complete.cases(s[, required]) &
+      s$Group %in% c("Arabica", "Robusta", "Unknown"),
+  ]
+
+  # Ensure each sample belongs to one group
+  group_check <- tapply(
+    s$Group,
+    s$SampleID,
+    function(x) length(unique(x))
+  )
+
+  if (any(group_check != 1)) {
+    stop("Each SampleID must belong to exactly one coffee group.")
+  }
+
+  # Assign chemical shift bins
+  s$BinID <- findInterval(
+    s$Shift_ppm,
+    edges,
+    rightmost.closed = TRUE
+  )
+
+  s <- s[
+    s$BinID >= 1 &
+      s$BinID < length(edges),
+  ]
+
+  # Sum peak areas for each sample and bin
+  agg <- aggregate(
+    Area ~ SampleID + Group + BinID,
+    data = s,
+    FUN = sum
+  )
+
+  ids <- unique(agg[, c("SampleID", "Group")])
+
+  X <- matrix(
+    0,
+    nrow = nrow(ids),
+    ncol = length(edges) - 1,
+    dimnames = list(
+      ids$SampleID,
+      paste0("ppm_", round(edges[-length(edges)], 3))
+    )
+  )
+
+  for (i in seq_len(nrow(agg))) {
+
+    rr <- match(
+      agg$SampleID[i],
+      ids$SampleID
+    )
+
+    X[rr, agg$BinID[i]] <- agg$Area[i]
+
+  }
+
+  # Log transformation
+  X <- log1p(X)
+
+  # Remove constant variables
+  keep <- apply(X, 2, sd) > 0
+
+  X <- X[, keep, drop = FALSE]
+
+  if (nrow(X) < 3 || ncol(X) < 2) {
+    stop("PCA requires at least 3 samples and 2 variable bins.")
+  }
+
+  # ==========================================================
+  # SECTION 7: PRINCIPAL COMPONENT ANALYSIS
+  # ==========================================================
+
+  pca <- prcomp(
+    X,
+    center = TRUE,
+    scale. = TRUE
+  )
+
+  eig <- pca$sdev^2
+
+  variance <- data.frame(
+    PC = seq_along(eig),
+    Eigenvalue = eig,
+    Variance_percent = 100 * eig / sum(eig),
+    Cumulative_percent = 100 * cumsum(eig) / sum(eig)
+  )
+
+  cat("\nPCA EXPLAINED VARIANCE:\n")
+  print(variance)
+
+  write.csv(
+    variance,
+    file.path(output, "04_PCA_Explained_Variance.csv"),
+    row.names = FALSE
+  )
+
+  # PCA scores
+  scores <- data.frame(
+    SampleID = ids$SampleID,
+    Group = ids$Group,
+    pca$x,
+    check.names = FALSE
+  )
+
+  write.csv(
+    scores,
+    file.path(output, "05_PCA_Scores.csv"),
+    row.names = FALSE
+  )
+
+  # ==========================================================
+  # SECTION 8: PCA LOADINGS AND CONTRIBUTIONS
+  # ==========================================================
+
+  loads <- data.frame(
+    Shift_Bin = rownames(pca$rotation),
+    pca$rotation,
+    check.names = FALSE
+  )
+
+  loads$PC1_Contribution_percent <-
+    100 * pca$rotation[, 1]^2 /
+    sum(pca$rotation[, 1]^2)
+
+  loads$PC2_Contribution_percent <-
+    100 * pca$rotation[, 2]^2 /
+    sum(pca$rotation[, 2]^2)
+
+  cat("\nTOP PC1 CONTRIBUTIONS:\n")
+
+  print(
+    head(
+      loads[order(-loads$PC1_Contribution_percent), ],
+      10
+    )
+  )
+
+  cat("\nTOP PC2 CONTRIBUTIONS:\n")
+
+  print(
+    head(
+      loads[order(-loads$PC2_Contribution_percent), ],
+      10
+    )
+  )
+
+  write.csv(
+    loads,
+    file.path(output, "06_PCA_Loadings.csv"),
+    row.names = FALSE
+  )
+
+  # ==========================================================
+  # SECTION 9: PCA SCORES GRAPH
+  # ==========================================================
+
+  pdf(
+    file.path(output, "Figure3_PCA_Scores.pdf"),
+    width = 8,
+    height = 6
+  )
+
+  plot(
+    scores$PC1,
+    scores$PC2,
+    pch = 19,
+    col = colors[scores$Group],
+    xlab = sprintf(
+      "PC1 (%.1f%%)",
+      variance$Variance_percent[1]
+    ),
+    ylab = sprintf(
+      "PC2 (%.1f%%)",
+      variance$Variance_percent[2]
+    ),
+    main = "PCA of Coffee NMR Metabolomic Profiles"
+  )
+
+  legend(
+    "topright",
+    legend = names(colors),
+    col = colors,
+    pch = 19,
+    bty = "n",
+    cex = 0.8
+  )
+
+  dev.off()
+
+  # ==========================================================
+  # SECTION 10: PCA LOADING GRAPH
+  # ==========================================================
+
+  pdf(
+    file.path(output, "Figure4_PCA_Loadings.pdf"),
+    width = 8,
+    height = 6
+  )
+
+  plot(
+    pca$rotation[, 1],
+    pca$rotation[, 2],
+    pch = 19,
+    cex = 0.6,
+    xlab = "PC1 Loading",
+    ylab = "PC2 Loading",
+    main = "NMR Metabolite Contributions to PCA"
+  )
+
+  abline(
+    h = 0,
+    v = 0,
+    lty = 2,
+    col = "gray"
+  )
+
+  dev.off()
+
+  # ==========================================================
+  # SECTION 11: ARABICA VS ROBUSTA WELCH T-TESTS
+  # ==========================================================
+
+  if (
+    sum(ids$Group == "Arabica") >= 2 &&
+    sum(ids$Group == "Robusta") >= 2
+  ) {
+
+    tt <- lapply(seq_len(ncol(X)), function(j) {
+
+      a <- X[ids$Group == "Arabica", j]
+      r <- X[ids$Group == "Robusta", j]
+
+      t0 <- tryCatch(
+        t.test(a, r),
+        error = function(e) NULL
+      )
+
+      data.frame(
+        Shift_Bin = colnames(X)[j],
+        Arabica_Mean = mean(a),
+        Arabica_SD = sd(a),
+        Robusta_Mean = mean(r),
+        Robusta_SD = sd(r),
+        t_stat = if (is.null(t0)) NA else unname(t0$statistic),
+        p_value = if (is.null(t0)) NA else t0$p.value
+      )
+
+    })
+
+    tests <- do.call(rbind, tt)
+
+    tests$BH_adjusted_p <- p.adjust(
+      tests$p_value,
+      method = "BH"
+    )
+
+    cat("\nARABICA VS ROBUSTA STATISTICAL TESTS:\n")
+    print(tests)
+
+    write.csv(
+      tests,
+      file.path(output, "07_Welch_Tests.csv"),
+      row.names = FALSE
+    )
+
+  }
+
+  # ==========================================================
+  # SECTION 12: UNKNOWN COFFEE IDENTIFICATION
+  # ==========================================================
+
+  known_groups <- c("Arabica", "Robusta")
+
+  if (
+    any(ids$Group == "Unknown") &&
+    all(known_groups %in% ids$Group)
+  ) {
+
+    centers <- do.call(
+      rbind,
+      lapply(known_groups, function(g) {
+
+        colMeans(
+          scores[
+            scores$Group == g,
+            c("PC1", "PC2"),
+            drop = FALSE
+          ]
+        )
+
+      })
+    )
+
+    rownames(centers) <- known_groups
+
+    u <- scores[scores$Group == "Unknown", ]
+
+    dist_table <- do.call(
+      rbind,
+      lapply(seq_len(nrow(u)), function(i) {
+
+        point <- as.numeric(
+          u[i, c("PC1", "PC2")]
+        )
+
+        distances <- sqrt(
+          rowSums(
+            sweep(centers, 2, point, "-")^2
+          )
+        )
+
+        data.frame(
+          SampleID = u$SampleID[i],
+          Arabica_Distance = distances[1],
+          Robusta_Distance = distances[2],
+          Nearest_Centroid = known_groups[
+            which.min(distances)
+          ]
+        )
+
+      })
+    )
+
+    cat("\nUNKNOWN SAMPLE CENTROID DISTANCES:\n")
+    print(dist_table)
+
+    write.csv(
+      dist_table,
+      file.path(output, "08_Unknown_Distances.csv"),
+      row.names = FALSE
+    )
+
+  }
+
+} else {
+
+  cat("\n")
+  cat("NOTE: Sample-level PCA and t-tests were skipped.\n")
+  cat("Your current CSV contains peak measurements without\n")
+  cat("independent sample identifiers.\n")
+  cat("To run PCA and species-level statistical comparisons,\n")
+  cat("provide NMR_Peaks_With_SampleID.csv.\n")
+
+}
+
+# ============================================================
+# FINISHED
+# ============================================================
+
+cat("\n========================================\n")
+cat("ANALYSIS COMPLETE\n")
+cat("Results saved in:", normalizePath(output), "\n")
+cat("========================================\n")
