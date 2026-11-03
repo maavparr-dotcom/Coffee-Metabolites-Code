@@ -1,0 +1,133 @@
+
+
+# ==============================================================================
+# LABORATORY WORK: METABOLOMICS PCA PLOT PROFILE
+# ==============================================================================
+
+# 1. LOAD REQUIRED LIBRARIES
+# ------------------------------------------------------------------------------
+library(stats)
+library(ggplot2)
+
+# 2. FILE IMPORT AND VIEW
+# ------------------------------------------------------------------------------
+# Opens an interactive pop-up window to cleanly select your CSV file
+c <- read.csv(file.choose(), row.names = NULL)
+print(c)
+
+# 3. DATA EXTRACTION & INTEGRITY CHECK
+# ------------------------------------------------------------------------------
+muestra <- c[[1]]
+num     <- c[, -1]
+
+# Automatically isolate numeric variables and remove missing/empty metrics
+num     <- num[, sapply(num, is.numeric)]
+ok      <- complete.cases(num)
+num     <- num[ok, ]
+muestra <- muestra[ok]
+
+# 4. COMPUTE PRINCIPAL COMPONENTS ANALYSIS (PCA)
+# ------------------------------------------------------------------------------
+pca     <- prcomp(num, scale. = TRUE)
+var_exp <- round(100 * pcasdev2/sum(pcasdev^2), 1)
+
+# Compile results into organized summary tables
+scores  <- data.frame(pca$x, muestra = muestra)
+tabla   <- data.frame(muestra = muestra, pca$x)
+print(tabla)
+
+# 5. VISUALIZATION SYSTEM (NEAT MINIMALIST STYLE)
+# ------------------------------------------------------------------------------
+ggplot(scores, aes(x = PC1, y = PC2, color = muestra)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(level = 0.95, size = 0.8, linetype = "solid") +
+  labs(
+    title    = "Metabolomics Cluster Analysis",
+    subtitle = "Principal Component Analysis Profile (Arabica vs. Robusta)",
+    x        = paste0("PC1 (", var_exp[1], "%)"),
+    y        = paste0("PC2 (", var_exp[2], "%)"),
+    color    = "Coffee Group"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14, margin = margin(b = 5)),
+    plot.subtitle    = element_text(color = "#555555", size = 10, margin = margin(b = 15)),
+    axis.title       = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right"
+  )
+
+# ==============================================================================
+# LAB 3 REPORT: METABOLOMICS OF COFFEE BEANS USING NMR 
+# COURSE: CHEM 124 - BIOANALYTICAL CHEMISTRY (FALL 2026)
+# ACS MANUSCRIPT COMPLIANT WORKFLOW SCRIPT
+# ==============================================================================
+
+# 1. LOAD REQUIRED LIBRARIES
+# ------------------------------------------------------------------------------
+library(stats)
+library(ggplot2)
+
+# 2. INTERACTIVE DATA IMPORT
+# ------------------------------------------------------------------------------
+# Safe handling for both Mac and Windows environments to avoid path connection errors
+c <- read.csv(file.choose(), row.names = NULL)
+print("--- RAW DATA SUMMARY MATRIX ---")
+print(head(c))
+
+# 3. EXTRACTION, VARIABLE SEPARATION & COMPREHENSIVE INTEGRITY FILTER
+# ------------------------------------------------------------------------------
+# Extract grouping labels (Arabica vs. Robusta vs. Unknown Sample)
+muestra <- c[[1]]
+num     <- c[, -1]
+
+# Drop non-numeric metadata columns and filter missing observations (NA/NaN/Inf)
+num     <- num[, sapply(num, is.numeric)]
+ok      <- complete.cases(num)
+num     <- num[ok, ]
+muestra <- muestra[ok]
+
+# 4. MULTIVARIATE STATISTICS: PRINCIPAL COMPONENT ANALYSIS (PCA)
+# ------------------------------------------------------------------------------
+# scale = TRUE is required to normalize peak intensities (caffeine, sucrose, CQAs)
+pca     <- prcomp(num, scale. = TRUE)
+var_exp <- round(100 * pcasdev2/sum(pcasdev^2), 1)
+
+# Compile calculations into summary tables for the App Note SI Section
+scores  <- data.frame(pca$x, muestra = muestra)
+tabla   <- data.frame(muestra = muestra, pca$x)
+
+print("--- EXPLAINED VARIANCE RATIO METRICS ---")
+print(var_exp)
+print("--- SUMMARY SCORES COORDINATE MATRIX ---")
+print(head(tabla))
+
+# 5. VISUALIZATION SYSTEM (ACS STYLE & RUBRIC COMPLIANT CAPTIONS)
+# ------------------------------------------------------------------------------
+# Formatted to comply with Word Style "VA_Figure_Caption" (Single/Double Column)
+ggplot(scores, aes(x = PC1, y = PC2, color = muestra)) +
+  geom_point(size = 3.5, alpha = 0.85) +
+  stat_ellipse(level = 0.95, size = 0.7, linetype = "solid") + # 95% Confidence Ellipse
+  labs(
+    title    = "Figure 1. PC 2 vs PC 1 scores plot from PCA calculation on NMR integral data.",
+    subtitle = "Analysis of water-extractable organic metabolites (caffeine, sucrose, trigonelline, CQAs).",
+    x        = paste0("PC1 (", var_exp[1], "%)"),
+    y        = paste0("PC2 (", var_exp[2], "%)"),
+    color    = "Coffee Subpopulation (muestra)"
+  ) +
+  theme_bw(base_size = 12) + # Crisp, high-contrast bordered template for publication
+  theme(
+    plot.title         = element_text(face = "bold", size = 11, hjust = 0.5, wrap = TRUE),
+    plot.subtitle      = element_text(color = "#444444", size = 9, hjust = 0.5, face = "italic"),
+    axis.title         = element_text(face = "bold", size = 10),
+    axis.text          = element_text(color = "black"),
+    panel.grid.major   = element_line(color = "#EAEAEA", linetype = "dashed"),
+    panel.grid.minor   = element_blank(),
+    legend.title       = element_text(face = "bold", size = 9),
+    legend.text        = element_text(size = 9),
+    legend.position    = "right",
+    legend.box.border  = element_rect(color = "#D3D3D3", size = 0.5)
+  )
+
+
+
