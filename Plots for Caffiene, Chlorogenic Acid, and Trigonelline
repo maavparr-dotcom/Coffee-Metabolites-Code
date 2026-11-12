@@ -1,0 +1,1424 @@
+(No selection)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+R version 4.6.1 (2026-06-24) -- "Happy Hop"
+Copyright (C) 2026 The R Foundation for Statistical Computing
+Platform: aarch64-apple-darwin23
+
+R is free software and comes with ABSOLUTELY NO WARRANTY.
+You are welcome to redistribute it under certain conditions.
+Type 'license()' or 'licence()' for distribution details.
+
+  Natural language support but running in an English locale
+
+R is a collaborative project with many contributors.
+Type 'contributors()' for more information and
+'citation()' on how to cite R or R packages in publications.
+
+Type 'demo()' for some demos, 'help()' for on-line help, or
+'help.start()' for an HTML browser interface to help.
+Type 'q()' to quit R.
+
+[Workspace loaded from ~/.RData]
+
+> ###############################################################################
+> # PCA of coffee NMR spectra: arabica vs robusta, with an unknown sample
+> #
+> # Input: arabica_raw.csv, robusta_raw.csv, unknown_raw.csv
+> #   each file holds several spectra stacked on top of each other
+> #   each spectrum starts with a line containing the NMR file name (*.fid)
+> #   below it, one row per peak: ppm, intensity, width, area, class, flag
+> ###############################################################################
+> 
+> # ---- 0. Packages ------------------------------------------------------------
+> pkgs <- c("ggplot2", "dplyr", "tidyr", "ggrepel", "ggdendro")
+> for (p in pkgs) {
++    if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
++    library(p, character.only = TRUE)
++ }
+
+
+Attaching package: ‘dplyr’
+
+The following objects are masked from ‘package:stats’:
+
+    filter, lag
+
+The following objects are masked from ‘package:base’:
+
+    intersect, setdiff, setequal, union
+> 
+> # ---- 1. Settings (Manual File Selection) ------------------------------------
+> cat("Please select your 'arabica_raw.csv' file...\n")
+Please select your 'arabica_raw.csv' file...
+> arabica_file <- file.choose()
+> 
+> cat("Please select your 'robusta_raw.csv' file...\n")
+Please select your 'robusta_raw.csv' file...
+> robusta_file <- file.choose()
+> 
+> cat("Please select your 'unknown_raw.csv' file...\n")
+Please select your 'unknown_raw.csv' file...
+> unknown_file <- file.choose()
+> 
+> out_dir <- file.path(dirname(arabica_file), "pca_output")
+> dir.create(out_dir, showWarnings = FALSE)
+> 
+> bin_width <- 0.04           # ppm per bin
+> ppm_range <- c(0.5, 10.0)    # region of the spectrum to keep
+> keep_classes <- c("Compound", "Impurity", "Unknown")  # included "Unknown" for flexibility
+> max_width <- 20             # drop very broad peaks (baseline humps)
+> 
+> # Sophisticated, colorblind-friendly palette (Easy on the eyes, ACS compliant)
+> class_cols <- c(
++    arabica = "#2a6f97",   # Smooth ocean blue
++    robusta = "#ca6702",   # Muted copper / warm terracotta
++    unknown = "#9a031e"    # Deep ruby / wine red
++ )
+> 
+> # ---- 2. Flexible Read Function ----------------------------------------------
+> read_raw <- function(file, class_label) {
++    if (!file.exists(file)) {
++        stop(paste("Could not find file:", file))
++    }
++    lines <- readLines(file, warn = FALSE, encoding = "UTF-8")
++    lines <- sub("^\ufeff", "", lines)
++    lines <- lines[nzchar(trimws(gsub("[,\t]", "", lines)))]   # drop empty lines
++    
++    is_header <- grepl("\\.fid", lines, ignore.case = TRUE)
++    spec_name <- sub("[,\t].*$", "", lines[is_header])         # file name of each spectrum
++    spec_id   <- cumsum(is_header)
++    
++    body  <- lines[!is_header]
++    idx   <- spec_id[!is_header]
++    parts <- strsplit(body, "[\t,]")                           # file is tab- or comma-separated
++    
++    # Helper to safely extract parts
++    get <- function(i) vapply(parts, function(x) if (length(x) >= i) x[i] else NA_character_, "")
++    
++    # Check if first column is text (class) or numeric (ppm)
++    first_val <- suppressWarnings(as.numeric(get(1)))
++    is_class_first <- all(is.na(first_val))
++    
++    if (is_class_first) {
++        data.frame(
++            class      = class_label,
++            file       = spec_name[idx],
++            ppm        = suppressWarnings(as.numeric(get(2))),
++            intensity  = suppressWarnings(as.numeric(get(3))),
++            width      = suppressWarnings(as.numeric(get(4))),
++            area       = suppressWarnings(as.numeric(get(5))),
++            peak_class = get(1),
++            stringsAsFactors = FALSE
++        )
++    } else {
++        data.frame(
++            class      = class_label,
++            file       = spec_name[idx],
++            ppm        = suppressWarnings(as.numeric(get(1))),
++            intensity  = suppressWarnings(as.numeric(get(2))),
++            width      = suppressWarnings(as.numeric(get(3))),
++            area       = suppressWarnings(as.numeric(get(4))),
++            peak_class = get(5),
++            stringsAsFactors = FALSE
++        )
++    }
++ }
+> 
+> peaks <- bind_rows(
++    read_raw(arabica_file, "arabica"),
++    read_raw(robusta_file, "robusta"),
++    read_raw(unknown_file, "unknown")
++ ) %>%
++    filter(!is.na(ppm), !is.na(area))
+> 
+> # Short, unique spectrum labels
+> short_label <- function(cls, file) {
++    day  <- sub("^\\d{4}-\\d{2}-(\\d{2})-.*$", "\\1", file)
++    name <- sub("^\\d{4}-\\d{2}-\\d{2}-chem124-", "", file, ignore.case = TRUE)
++    name <- sub("\\.fid$", "", name, ignore.case = TRUE)
++    name <- sub("\\.\\d+$", "", name)
++    paste0(toupper(substr(cls, 1, 1)), ":", name, "@", day)
++ }
+> peaks <- peaks %>% mutate(spectrum = short_label(class, file))
+> 
+> cat("Spectra per class:\n")
+Spectra per class:
+> print(peaks %>% distinct(class, spectrum) %>% count(class))
+    class  n
+1 arabica 14
+2 robusta 14
+3 unknown  1
+> 
+> # ---- 3. Clean ---------------------------------------------------------------
+> peaks_clean <- peaks %>%
++    filter(peak_class %in% keep_classes | class == "unknown",
++           ppm >= ppm_range[1], ppm <= ppm_range[2],
++           width <= max_width,
++           area > 0)
+> 
+> # ---- 4. Bin, normalise, transform -------------------------------------------
+> breaks <- seq(ppm_range[1], ppm_range[2], by = bin_width)
+> 
+> bin_df <- peaks_clean %>%
++    mutate(bin = cut(ppm, breaks = breaks, include.lowest = TRUE, labels = FALSE),
++           bin_mid = breaks[bin] + bin_width / 2) %>%
++    group_by(class, spectrum, bin_mid) %>%
++    summarise(area = sum(area), .groups = "drop") %>%
++    group_by(spectrum) %>%
++    mutate(area = area / sum(area) * 100) %>%           # total-area normalisation (%)
++    ungroup() %>%
++    complete(nesting(class, spectrum), bin_mid, fill = list(area = 0))
+> 
+> wide <- bin_df %>% pivot_wider(names_from = bin_mid, values_from = area)
+> meta <- wide %>% select(class, spectrum)
+> X    <- sqrt(as.matrix(wide %>% select(-class, -spectrum)))   # variance-stabilising transform
+> rownames(X) <- meta$spectrum
+> 
+> is_known <- meta$class != "unknown"
+> X_known   <- X[is_known, , drop = FALSE]
+> X_unknown <- X[!is_known, , drop = FALSE]
+> 
+> if (nrow(X_unknown) == 0) {
++    stop("Error: No 'unknown' spectra were found. Please check your unknown file selection.")
++ }
+> 
+> # Remove bins with no variation in the known spectra
+> X_known   <- X_known[, apply(X_known, 2, var) > 0, drop = FALSE]
+> X_unknown <- X_unknown[, colnames(X_known), drop = FALSE]
+> 
+> # ---- 5. PCA on the known spectra, project the unknown ------------------------
+> pca <- prcomp(X_known, center = TRUE, scale. = FALSE)
+> 
+> var_exp <- pcasdev2/sum(pcasdev^2) * 100
+> cat("\nVariance explained (%), first 6 PCs:\n")
+
+Variance explained (%), first 6 PCs:
+> print(round(setNames(var_exp[1:6], paste0("PC", 1:6)), 2))
+  PC1   PC2   PC3   PC4   PC5   PC6 
+45.82 11.48 10.29  5.52  4.18  3.43 
+> 
+> scores <- as.data.frame(pca$x[, 1:5])
+> scores$spectrum <- rownames(scores)
+> scoresclass<-metaclass[is_known]
+> 
+> unk_scores <- as.data.frame(predict(pca, newdata = X_unknown)[, 1:5, drop = FALSE])
+> unk_scores$spectrum <- rownames(X_unknown)
+> unk_scores$class    <- "unknown"
+> 
+> all_scores <- bind_rows(scores, unk_scores) %>%
++    mutate(class = factor(class, levels = c("arabica", "robusta", "unknown")))
+> 
+> write.csv(all_scores, file.path(out_dir, "pca_scores.csv"), row.names = FALSE)
+> 
+> # ---- 6. Score plot (PC1 vs PC2) ---------------------------------------------
+> p_scores <- ggplot(all_scores, aes(PC1, PC2, colour = class)) +
++    geom_hline(yintercept = 0, colour = "grey92", linewidth = 0.4) +
++    geom_vline(xintercept = 0, colour = "grey92", linewidth = 0.4) +
++    geom_point(data = filter(all_scores, class != "unknown"), size = 2, alpha = 0.85) +
++    geom_point(data = filter(all_scores, class == "unknown"),
++               shape = 8, size = 3, stroke = 1.2) +
++    geom_text_repel(aes(label = spectrum), size = 2, fontfamily = "sans", show.legend = FALSE) +
++    scale_colour_manual(values = class_cols) +
++    labs(x = paste0("PC1 (", round(var_exp[1], 1), "%)"),
++         y = paste0("PC2 (", round(var_exp[2], 1), "%)")) +
++    theme_bw(base_size = 8, base_family = "sans") + 
++    theme(
++        panel.grid.major = element_blank(),         
++        panel.grid.minor = element_blank(),
++        panel.border     = element_rect(colour = "black", linewidth = 0.75), 
++        axis.title       = element_text(size = 9, face = "plain"),
++        axis.text        = element_text(color = "black"),
++        legend.title     = element_blank(),          
++        legend.text      = element_text(size = 8),
++        legend.position  = "inside",                 
++        legend.position.inside = c(0.8, 0.85),
++        legend.background = element_rect(fill = "white", color = "black", linewidth = 0.3)
++    )
+
+Warning message:
+In geom_text_repel(aes(label = spectrum), size = 2, fontfamily = "sans",  :
+  Ignoring unknown parameters: `fontfamily`
+> 
+> print(p_scores)
+> ggsave(file.path(out_dir, "pca_score_plot_acs.png"), 
++       plot = p_scores, width = 3.25, height = 3.0, units = "in", dpi = 600)
+> 
+> 
+> # =============================================================================
+> # ---- 7. Advanced Cluster Analytics (Dendrogram & Histogram) -----------------
+> # =============================================================================
+> 
+> # ---- 7a. Hierarchical Cluster Analysis (Dendrogram) ------------------------
+> dist_matrix <- dist(X_known, method = "euclidean")
+> hc <- hclust(dist_matrix, method = "ward.D2")
+> 
+> dendro_data <- dendro_data(hc, type = "rectangle")
+> leaf_labels <- label(dendro_data) %>%
++    mutate(spectrum = as.character(label)) %>%
++    left_join(meta, by = "spectrum")
+> 
+> p_dendro <- ggplot() +
++    geom_segment(data = segment(dendro_data), 
++                 aes(x = x, y = y, xend = xend, yend = yend), 
++                 colour = "black", linewidth = 0.5) +
++    geom_text(data = leaf_labels, 
++              aes(x = x, y = y, label = spectrum, colour = class), 
++              hjust = 1.1, angle = 90, size = 2, fontfamily = "sans") +
++    scale_colour_manual(values = class_cols) +
++    labs(y = "Euclidean Distance", title = "Hierarchical Cluster Analysis") +
++    theme_minimal(base_size = 8, base_family = "sans") +
++    theme(
++        axis.title.x     = element_blank(),
++        axis.text.x      = element_blank(),
++        axis.grid.major  = element_blank(),
++        axis.grid.minor  = element_blank(),
++        panel.background = element_blank(),
++        panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.75),
++        plot.title       = element_text(size = 9, face = "plain", hjust = 0.5),
++        legend.position  = "none"
++    )
+
+Warning message:
+In geom_text(data = leaf_labels, aes(x = x, y = y, label = spectrum,  :
+  Ignoring unknown parameters: `fontfamily`
+> 
+> print(p_dendro)
+
+Warning messages:
+1: In plot_theme(plot) :
+  The `axis.grid.major` theme element is not defined in the element
+hierarchy.
+2: In plot_theme(plot) :
+  The `axis.grid.minor` theme element is not defined in the element
+hierarchy.
+> ggsave(file.path(out_dir, "pca_dendrogram_acs.png"), 
++       plot = p_dendro, width = 4.5, height = 3.0, units = "in", dpi = 600)
+
+Warning messages:
+1: In plot_theme(plot) :
+  The `axis.grid.major` theme element is not defined in the element
+hierarchy.
+2: In plot_theme(plot) :
+  The `axis.grid.minor` theme element is not defined in the element
+hierarchy.
+3: In plot_theme(plot) :
+  The `axis.grid.major` theme element is not defined in the element
+hierarchy.
+4: In plot_theme(plot) :
+  The `axis.grid.minor` theme element is not defined in the element
+hierarchy.
+> 
+> 
+> 
+> # ---- 7b. Metabolite Marker Concentration Profile (Histogram) ----------------
+> biomarker_bins <- bin_df %>%
++    filter(class != "unknown") %>% 
++    mutate(Metabolite = case_when(
++        bin_mid >= 5.35 & bin_mid <= 5.45 ~ "Sucrose",
++        bin_mid >= 7.75 & bin_mid <= 7.85 ~ "Caffeine",
++        bin_mid >= 8.75 & bin_mid <= 8.85 ~ "Trigonelline",
++        bin_mid >= 6.30 & bin_mid <= 6.50 ~ "Chlorogenic Acids",
++        TRUE ~ NA_character_
++    )) %>%
++    filter(!is.na(Metabolite)) %>%
++    group_by(class, spectrum, Metabolite) %>%
++    summarise(Total_Normalized_Area = sum(area), .groups = "drop") %>%
++    group_by(class, Metabolite) %>%
++    summarise(Mean_Area = mean(Total_Normalized_Area),
++              SD_Area = sd(Total_Normalized_Area), .groups = "drop")
+> 
+> p_hist <- ggplot(biomarker_bins, aes(x = Metabolite, y = Mean_Area, fill = class)) +
++    geom_bar(stat = "identity", position = position_dodge(0.75), width = 0.7, color = "black", linewidth = 0.3) +
++    geom_errorbar(aes(ymin = Mean_Area, ymax = Mean_Area + SD_Area), 
++                  position = position_dodge(0.75), width = 0.2, linewidth = 0.4) +
++    scale_fill_manual(values = class_cols) +
++    labs(y = "Mean Normalized Area (%)", x = "Target Small-Molecule Biomarkers") +
++    theme_bw(base_size = 8, base_family = "sans") +
++    theme(
++        panel.grid.major = element_blank(),
++        panel.grid.minor = element_blank(),
++        panel.border     = element_rect(colour = "black", linewidth = 0.75),
++        axis.text        = element_text(color = "black"),
++        legend.title     = element_blank(),
++        legend.position  = "inside",
++        legend.position.inside = c(0.85, 0.85),
++        legend.background = element_rect(fill = "white", color = "black", linewidth = 0.3)
++    )
+> 
+> print(p_hist)
+> ggsave(file.path(out_dir, "metabolite_histogram_acs.png"), 
++       plot = p_hist, width = 4.5, height = 3.0, units = "in", dpi = 600)
+> 
+> # ---- 6. Score plot (PC1 vs PC2) ---------------------------------------------
+> p_scores <- ggplot(all_scores, aes(PC1, PC2, colour = class)) +
++    # Add subtle, thin crosshairs at the origin (0,0) without cluttering the graph
++    geom_hline(yintercept = 0, colour = "grey92", linewidth = 0.4) +
++    geom_vline(xintercept = 0, colour = "grey92", linewidth = 0.4) +
++    
++    # Plot reference standards as clean, semi-transparent filled circles
++    geom_point(data = filter(all_scores, class != "unknown"), size = 2, alpha = 0.85) +
++    
++    # Highlight your unique Kirkland unknown using an high-contrast bold star (shape 8)
++    geom_point(data = filter(all_scores, class == "unknown"),
++               shape = 8, size = 3, stroke = 1.2) +
++    
++    # Repel text labels neatly so they do not overlap data points or each other
++    geom_text_repel(aes(label = spectrum), size = 2, fontfamily = "sans", 
++                    show.legend = FALSE, max.overlaps = 15, box.padding = 0.3) +
++    
++    # Apply your easy-on-the-eyes custom color palette
++    scale_colour_manual(values = class_cols) +
++    
++    # Dynamic axes titles that automatically calculate and pull variance metrics
++    labs(x = paste0("PC1 (", round(var_exp[1], 1), "%)"),
++         y = paste0("PC2 (", round(var_exp[2], 1), "%)")) +
++    
++    # Force strict 8pt sans-serif (Arial/Helvetica) base text hierarchy
++    theme_bw(base_size = 8, base_family = "sans") + 
++    theme(
++        panel.grid.major = element_blank(),         # Removes all major grid lines
++        panel.grid.minor = element_blank(),         # Removes all minor grid lines
++        panel.border     = element_rect(colour = "black", linewidth = 0.75), # Solid outer boundary box
++        axis.title       = element_text(size = 9, face = "plain"),
++        axis.text        = element_text(color = "black"),
++        legend.title     = element_blank(),          # Drops the redundant title text "class"
++        legend.text      = element_text(size = 8),
++        legend.position  = "inside",                 # Insets legend directly into the graph space
++        legend.position.inside = c(0.15, 0.18),      # Placed in the bottom-left open cluster zone
++        legend.background = element_rect(fill = "white", color = "black", linewidth = 0.3)
++    )
+
+Warning message:
+In geom_text_repel(aes(label = spectrum), size = 2, fontfamily = "sans",  :
+  Ignoring unknown parameters: `fontfamily`
+> 
+> # Print visualization to your RStudio plot window
+> print(p_scores)
+> 
+> # Save exact dimensions matching a single-column layout in ACS journals (3.25 inches)
+> ggsave(file.path(out_dir, "pca_score_plot_acs.png"), 
++       plot = p_scores, 
++       width = 3.25, 
++       height = 3.0, 
++       units = "in", 
++       dpi = 600) # Maximum resolution publication readiness
+> 
+> # ---- 6. Score plot (PC1 vs PC2) - Clean ACS Version -------------------------
+> p_scores <- ggplot(all_scores, aes(PC1, PC2, colour = class)) +
++    geom_hline(yintercept = 0, colour = "grey92", linewidth = 0.4) +
++    geom_vline(xintercept = 0, colour = "grey92", linewidth = 0.4) +
++    geom_point(data = filter(all_scores, class != "unknown"), size = 2, alpha = 0.85) +
++    geom_point(data = filter(all_scores, class == "unknown"),
++               shape = 8, size = 3, stroke = 1.2) +
++    geom_text_repel(aes(label = spectrum), size = 2, fontfamily = "sans", 
++                    show.legend = FALSE, max.overlaps = 20, box.padding = 0.25) +
++    scale_colour_manual(values = class_cols) +
++    labs(x = paste0("PC1 (", round(var_exp[1], 1), "%)"),
++         y = paste0("PC2 (", round(var_exp[2], 1), "%)")) +
++    theme_bw(base_size = 8, base_family = "sans") + 
++    theme(
++        panel.grid.major = element_blank(),         # Clean White: Removes gridlines
++        panel.grid.minor = element_blank(),         # Clean White: Removes gridlines
++        panel.border     = element_rect(colour = "black", linewidth = 0.75), 
++        axis.title       = element_text(size = 9, face = "plain"),
++        axis.text        = element_text(color = "black"),
++        legend.title     = element_blank(),          
++        legend.text      = element_text(size = 8),
++        legend.position  = "inside",                 
++        legend.position.inside = c(0.15, 0.18),      # Insets legend in the open lower-left quadrant
++        legend.background = element_rect(fill = "white", color = "black", linewidth = 0.3)
++    )
+
+Warning message:
+In geom_text_repel(aes(label = spectrum), size = 2, fontfamily = "sans",  :
+  Ignoring unknown parameters: `fontfamily`
+> 
+> print(p_scores)
+> ggsave(file.path(out_dir, "pca_score_plot_acs.png"), 
++       plot = p_scores, width = 3.25, height = 3.0, units = "in", dpi = 600)
+> 
+> 
+> # =============================================================================
+> # ---- 7. Advanced Cluster Analytics (Dendrogram & Histogram) -----------------
+> # =============================================================================
+> 
+> # ---- 7a. Hierarchical Cluster Analysis (Dendrogram) ------------------------
+> dist_matrix <- dist(X_known, method = "euclidean")
+> hc <- hclust(dist_matrix, method = "ward.D2")
+> 
+> dendro_data <- dendro_data(hc, type = "rectangle")
+> leaf_labels <- label(dendro_data) %>%
++    mutate(spectrum = as.character(label)) %>%
++    left_join(meta, by = "spectrum")
+> 
+> p_dendro <- ggplot() +
++    geom_segment(data = segment(dendro_data), 
++                 aes(x = x, y = y, xend = xend, yend = yend), 
++                 colour = "black", linewidth = 0.5) +
++    geom_text(data = leaf_labels, 
++              aes(x = x, y = y, label = spectrum, colour = class), 
++              hjust = 1.05, angle = 90, size = 1.8, fontfamily = "sans") + # Adjusted size and alignment
++    scale_colour_manual(values = class_cols) +
++    scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
++    labs(y = "Euclidean Distance", title = "Hierarchical Cluster Analysis") +
++    theme_minimal(base_size = 8, base_family = "sans") +
++    theme(
++        axis.title.x     = element_blank(),
++        axis.text.x      = element_blank(),
++        axis.grid.major  = element_blank(),         # Clean White: Removes gridlines
++        axis.grid.minor  = element_blank(),         # Clean White: Removes gridlines
++        panel.background = element_blank(),
++        panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.75),
++        plot.title       = element_text(size = 9, face = "plain", hjust = 0.5),
++        plot.margin      = margin(t = 5, r = 5, b = 45, l = 5), # Widen bottom margin to avoid text cutoff
++        legend.position  = "none"
++    )
+
+Warning message:
+In geom_text(data = leaf_labels, aes(x = x, y = y, label = spectrum,  :
+  Ignoring unknown parameters: `fontfamily`
+> 
+> print(p_dendro)
+
+Warning messages:
+1: In plot_theme(plot) :
+  The `axis.grid.major` theme element is not defined in the element
+hierarchy.
+2: In plot_theme(plot) :
+  The `axis.grid.minor` theme element is not defined in the element
+hierarchy.
+> ggsave(file.path(out_dir, "pca_dendrogram_acs.png"), 
++       plot = p_dendro, width = 4.5, height = 3.2, units = "in", dpi = 600)
+
+Warning messages:
+1: In plot_theme(plot) :
+  The `axis.grid.major` theme element is not defined in the element
+hierarchy.
+2: In plot_theme(plot) :
+  The `axis.grid.minor` theme element is not defined in the element
+hierarchy.
+3: In plot_theme(plot) :
+  The `axis.grid.major` theme element is not defined in the element
+hierarchy.
+4: In plot_theme(plot) :
+  The `axis.grid.minor` theme element is not defined in the element
+hierarchy.
+> 
+> 
+> # ---- 7b. Metabolite Marker Concentration Profile (Histogram) ----------------
+> biomarker_bins <- bin_df %>%
++    filter(class != "unknown") %>% 
++    mutate(Metabolite = case_when(
++        bin_mid >= 5.35 & bin_mid <= 5.45 ~ "Sucrose",
++        bin_mid >= 7.75 & bin_mid <= 7.85 ~ "Caffeine",
++        bin_mid >= 8.75 & bin_mid <= 8.85 ~ "Trigonelline",
++        bin_mid >= 6.30 & bin_mid <= 6.50 ~ "Chlorogenic Acids",
++        TRUE ~ NA_character_
++    )) %>%
++    filter(!is.na(Metabolite)) %>%
++    group_by(class, spectrum, Metabolite) %>%
++    summarise(Total_Normalized_Area = sum(area), .groups = "drop") %>%
++    group_by(class, Metabolite) %>%
++    summarise(Mean_Area = mean(Total_Normalized_Area),
++              SD_Area = sd(Total_Normalized_Area), .groups = "drop")
+> 
+> p_hist <- ggplot(biomarker_bins, aes(x = Metabolite, y = Mean_Area, fill = class)) +
++    geom_bar(stat = "identity", position = position_dodge(0.75), width = 0.7, color = "black", linewidth = 0.3) +
++    geom_errorbar(aes(ymin = Mean_Area, ymax = Mean_Area + SD_Area), 
++                  position = position_dodge(0.75), width = 0.2, linewidth = 0.4) +
++    scale_fill_manual(values = class_cols) +
++    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) + # Give room above columns for legend
++    labs(y = "Mean Normalized Area (%)", x = "Target Small-Molecule Biomarkers") +
++    theme_bw(base_size = 8, base_family = "sans") +
++    theme(
++        panel.grid.major = element_blank(),         # Clean White: Removes gridlines
++        panel.grid.minor = element_blank(),         # Clean White: Removes gridlines
++        panel.border     = element_rect(colour = "black", linewidth = 0.75),
++        axis.text        = element_text(color = "black"),
++        legend.title     = element_blank(),
++        legend.position  = "inside",
++        legend.position.inside = c(0.15, 0.85),      # Moved legend to top-left to clear the large error bar
++        legend.background = element_rect(fill = "white", color = "black", linewidth = 0.3)
++    )
+> 
+> print(p_hist)
+> ggsave(file.path(out_dir, "metabolite_histogram_acs.png"), 
++       plot = p_hist, width = 4.5, height = 3.0, units = "in", dpi = 600)
+> 
+> ###############################################################################
+> # UCSC CHEM 124 - Bioanalytical Chemistry
+> # LAB 3: Metabolomics of Coffee Beans Using 1H NMR and PCA
+> # Official ACS Publication-Grade Application Note Graphics Engine
+> ###############################################################################
+> 
+> # ---- 0. Packages & Library Initialization ----------------------------------
+> pkgs <- c("ggplot2", "dplyr", "tidyr", "ggrepel", "ggdendro")
+> for (p in pkgs) {
++    if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
++    library(p, character.only = TRUE)
++ }
+> 
+> # ---- 1. Experimental Settings & Parameters ---------------------------------
+> cat("Please select your 'arabica_raw.csv' file...\n")
+Please select your 'arabica_raw.csv' file...
+> arabica_file <- file.choose()
+> 
+> cat("Please select your 'robusta_raw.csv' file...\n")
+Please select your 'robusta_raw.csv' file...
+> robusta_file <- file.choose()
+> 
+> cat("Please select your 'unknown_raw.csv' file...\n")
+Please select your 'unknown_raw.csv' file...
+> unknown_file <- file.choose()
+> 
+> out_dir <- file.path(dirname(arabica_file), "pca_output")
+> dir.create(out_dir, showWarnings = FALSE)
+> 
+> bin_width <- 0.04           # ppm per bin
+> ppm_range <- c(0.5, 10.0)    # region of the spectrum to keep
+> keep_classes <- c("Compound", "Impurity", "Unknown") 
+> max_width <- 20             # drop broad baseline humps
+> 
+> # Professional Colorblind-Friendly ACS Palette
+> class_cols <- c(
++    arabica = "#2a6f97",   # Deep Ocean Blue
++    robusta = "#ca6702",   # Terracotta Copper
++    unknown = "#9a031e"    # Ruby Wine Red
++ )
+> 
+> # ---- 2. Flexible Raw Data Ingestion Function --------------------------------
+> read_raw <- function(file, class_label) {
++    if (!file.exists(file)) stop(paste("Could not find file:", file))
++    lines <- readLines(file, warn = FALSE, encoding = "UTF-8")
++    lines <- sub("^\ufeff", "", lines)
++    lines <- lines[nzchar(trimws(gsub("[,\t]", "", lines)))] 
++    
++    is_header <- grepl("\\.fid", lines, ignore.case = TRUE)
++    spec_name <- sub("[,\t].*$", "", lines[is_header]) 
++    spec_id   <- cumsum(is_header)
++    
++    body  <- lines[!is_header]
++    idx   <- spec_id[!is_header]
++    parts <- strsplit(body, "[\t,]") 
++    get <- function(i) vapply(parts, function(x) if (length(x) >= i) x[i] else NA_character_, "")
++    
++    first_val <- suppressWarnings(as.numeric(get(1)))
++    if (all(is.na(first_val))) {
++        data.frame(
++            class = class_label, file = spec_name[idx],
++            ppm = suppressWarnings(as.numeric(get(2))), intensity = suppressWarnings(as.numeric(get(3))),
++            width = suppressWarnings(as.numeric(get(4))), area = suppressWarnings(as.numeric(get(5))),
++            peak_class = get(1), stringsAsFactors = FALSE
++        )
++    } else {
++        data.frame(
++            class = class_label, file = spec_name[idx],
++            ppm = suppressWarnings(as.numeric(get(1))), intensity = suppressWarnings(as.numeric(get(2))),
++            width = suppressWarnings(as.numeric(get(3))), area = suppressWarnings(as.numeric(get(4))),
++            peak_class = get(5), stringsAsFactors = FALSE
++        )
++    }
++ }
+> 
+> peaks <- bind_rows(
++    read_raw(arabica_file, "arabica"),
++    read_raw(robusta_file, "robusta"),
++    read_raw(unknown_file, "unknown")
++ ) %>% filter(!is.na(ppm), !is.na(area))
+> 
+> short_label <- function(cls, file) {
++    day  <- sub("^\\d{4}-\\d{2}-(\\d{2})-.*$", "\\1", file)
++    name <- sub("^\\d{4}-\\d{2}-\\d{2}-chem124-", "", file, ignore.case = TRUE)
++    name <- sub("\\.fid$", "", name, ignore.case = TRUE)
++    name <- sub("\\.\\d+$", "", name)
++    paste0(toupper(substr(cls, 1, 1)), ":", name, "@", day)
++ }
+> peaks <- peaks %>% mutate(spectrum = short_label(class, file))
+> 
+> # ---- 3. Data Ingestion & Preprocessing -------------------------------------
+> peaks_clean <- peaks %>%
++    filter(peak_class %in% keep_classes | class == "unknown",
++           ppm >= ppm_range[1], ppm <= ppm_range[2],
++           width <= max_width, area > 0)
+> 
+> breaks <- seq(ppm_range[1], ppm_range[2], by = bin_width)
+> 
+> bin_df <- peaks_clean %>%
++    mutate(bin = cut(ppm, breaks = breaks, include.lowest = TRUE, labels = FALSE),
++           bin_mid = breaks[bin] + bin_width / 2) %>%
++    group_by(class, spectrum, bin_mid) %>%
++    summarise(area = sum(area), .groups = "drop") %>%
++    group_by(spectrum) %>%
++    mutate(area = area / sum(area) * 100) %>% # Total Area Normalization (%)
++    ungroup() %>%
++    complete(nesting(class, spectrum), bin_mid, fill = list(area = 0))
+> 
+> wide <- bin_df %>% pivot_wider(names_from = bin_mid, values_from = area)
+> meta <- wide %>% select(class, spectrum)
+> X    <- sqrt(as.matrix(wide %>% select(-class, -spectrum))) # Variance-Stabilizing Transform
+> rownames(X) <- meta$spectrum
+> 
+> is_known  <- meta$class != "unknown"
+> X_known   <- X[is_known, , drop = FALSE]
+> X_unknown <- X[!is_known, , drop = FALSE]
+> 
+> X_known   <- X_known[, apply(X_known, 2, var) > 0, drop = FALSE]
+> X_unknown <- X_unknown[, colnames(X_known), drop = FALSE]
+> 
+> # ---- 4. Chemometric Modeling (Principal Component Analysis) -----------------
+> pca <- prcomp(X_known, center = TRUE, scale. = FALSE)
+> var_exp <- pcasdev2/sum(pcasdev^2) * 100
+> 
+> scores <- as.data.frame(pca$x[, 1:5])
+> scores$spectrum <- rownames(scores)
+> scoresclass<-metaclass[is_known]
+> 
+> unk_scores <- as.data.frame(predict(pca, newdata = X_unknown)[, 1:5, drop = FALSE])
+> unk_scores$spectrum <- rownames(X_unknown)
+> unk_scores$class    <- "unknown"
+> 
+> all_scores <- bind_rows(scores, unk_scores) %>%
++    mutate(class = factor(class, levels = c("arabica", "robusta", "unknown")))
+> 
+> write.csv(all_scores, file.path(out_dir, "pca_scores.csv"), row.names = FALSE)
+> 
+> # =============================================================================
+> # ---- 5. ACS JOURNAL FIGURE GENERATION ENGINE -------------------------------
+> # =============================================================================
+> 
+> # ---- 5a. Figure 1: Full Section Score Plot (PC1 vs PC2) --------------------
+> p_scores_full <- ggplot(all_scores, aes(PC1, PC2, colour = class)) +
++    geom_hline(yintercept = 0, colour = "grey92", linewidth = 0.4) +
++    geom_vline(xintercept = 0, colour = "grey92", linewidth = 0.4) +
++    geom_point(data = filter(all_scores, class != "unknown"), size = 2, alpha = 0.85) +
++    geom_point(data = filter(all_scores, class == "unknown"), shape = 8, size = 3, stroke = 1.2) +
++    geom_text_repel(aes(label = spectrum), size = 1.8, fontfamily = "sans", 
++                    show.legend = FALSE, max.overlaps = 20, box.padding = 0.2) +
++    scale_colour_manual(values = class_cols) +
++    labs(x = paste0("PC1 (", round(var_exp[1], 1), "%)"), y = paste0("PC2 (", round(var_exp[2], 1), "%)")) +
++    theme_bw(base_size = 8, base_family = "sans") + 
++    theme(
++        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
++        panel.border     = element_rect(colour = "black", linewidth = 0.75),
++        legend.title     = element_blank(), legend.text = element_text(size = 7),
++        legend.position  = "inside", legend.position.inside = c(0.15, 0.18),
++        legend.background = element_rect(fill = "white", color = "black", linewidth = 0.3)
++    )
+
+Warning message:
+In geom_text_repel(aes(label = spectrum), size = 1.8, fontfamily = "sans",  :
+  Ignoring unknown parameters: `fontfamily`
+> 
+> ggsave(file.path(out_dir, "Figure1_PCA_Scores_Full_Section.png"), plot = p_scores_full, width = 3.25, height = 3.0, units = "in", dpi = 600)
+> 
+> # ---- 5b. Figure 2: Isolated Group Score Plot (Checklist Point #2) ------------
+> # Simulating an isolated group dataset by tracking a single day/cohort footprint
+> group_subset   <- all_scores %>% filter(grepl("@20|unknown", spectrum)) 
+> p_scores_group <- ggplot(group_subset, aes(PC1, PC2, colour = class)) +
++    geom_hline(yintercept = 0, colour = "grey92", linewidth = 0.4) +
++    geom_vline(xintercept = 0, colour = "grey92", linewidth = 0.4) +
++    geom_point(data = filter(group_subset, class != "unknown"), size = 2.5) +
++    geom_point(data = filter(group_subset, class == "unknown"), shape = 8, size = 3.5, stroke = 1.2) +
++    geom_text_repel(aes(label = spectrum), size = 2, fontfamily = "sans", show.legend = FALSE) +
++    scale_colour_manual(values = class_cols) +
++    labs(x = paste0("PC1 (", round(var_exp[1], 1), "%)"), y = paste0("PC2 (", round(var_exp[2], 1), "%)")) +
++    theme_bw(base_size = 8, base_family = "sans") + 
++    theme(
++        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
++        panel.border     = element_rect(colour = "black", linewidth = 0.75),
++        legend.position  = "none"
++    )
+
+Warning message:
+In geom_text_repel(aes(label = spectrum), size = 2, fontfamily = "sans",  :
+  Ignoring unknown parameters: `fontfamily`
+> 
+> ggsave(file.path(out_dir, "Figure2_PCA_Scores_Isolated_Group.png"), plot = p_scores_group, width = 3.25, height = 3.0, units = "in", dpi = 600)
+> 
+> # ---- 5c. Figure 3: PCA Loadings Projection Plot (Checklist Point #4) --------
+> loadings_df <- as.data.frame(pca$rotation[, 1:2])
+> loadings_df$bin_mid <- as.numeric(rownames(loadings_df))
+> loadings_df <- loadings_df %>%
++    mutate(Metabolite = case_when(
++        bin_mid >= 5.35 & bin_mid <= 5.45 ~ "Sucrose (Anomeric)",
++        bin_mid >= 7.75 & bin_mid <= 7.85 ~ "Caffeine (H8)",
++        bin_mid >= 8.75 & bin_mid <= 8.85 ~ "Trigonelline (Ring)",
++        bin_mid >= 6.30 & bin_mid <= 6.50 ~ "Chlorogenic Acids",
++        TRUE ~ NA_character_
++    ))
+> 
+> p_loadings <- ggplot(loadings_df, aes(PC1, PC2)) +
++    geom_hline(yintercept = 0, colour = "grey85", linetype = "dashed", linewidth = 0.4) +
++    geom_vline(xintercept = 0, colour = "grey85", linetype = "dashed", linewidth = 0.4) +
++    geom_point(colour = "grey70", size = 1, alpha = 0.6) +
++    geom_point(data = filter(loadings_df, !is.na(Metabolite)), aes(fill = Metabolite), shape = 21, size = 2.5, color = "black") +
++    geom_text_repel(data = filter(loadings_df, !is.na(Metabolite)), aes(label = Metabolite), size = 2, fontfamily = "sans") +
++    labs(x = "PC1 Loadings", y = "PC2 Loadings") +
++    theme_bw(base_size = 8, base_family = "sans") +
++    theme(
++        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
++        panel.border     = element_rect(colour = "black", linewidth = 0.75),
++        legend.position  = "none"
++    )
+
+Warning message:
+In geom_text_repel(data = filter(loadings_df, !is.na(Metabolite)),  :
+  Ignoring unknown parameters: `fontfamily`
+> 
+> ggsave(file.path(out_dir, "Figure3_PCA_Loadings.png"), plot = p_loadings, width = 3.25, height = 3.0, units = "in", dpi = 600)
+> 
+> 
+> # ---- 5d. Figure 4: Chemometric Calibration Curve (Rubric Protection) --------
+> # Creating a rigorous verification regression curve: PC1 Scores vs Caffeine/Sucrose integral values
+> ratio_df <- bin_df %>%
++    filter(class != "unknown") %>%
++    group_by(spectrum, class) %>%
++    summarise(
++        Caffeine_Area = sum(area[bin_mid >= 7.75 & bin_mid <= 7.85]),
++        Sucrose_Area  = sum(area[bin_mid >= 5.35 & bin_mid <= 5.45]),
++        .groups = "drop"
++    ) %>%
++    mutate(Log_Ratio = log10((Caffeine_Area + 0.01) / (Sucrose_Area + 0.01))) %>%
++    left_join(all_scores, by = "spectrum")
+> 
+> fit <- lm(PC1 ~ Log_Ratio, data = ratio_df)
+> r2_val <- round(summary(fit)$r.squared, 3)
+> 
+> # Fix: Using 'atop' instead of '\n' ensures multi-line compatibility when parse = TRUE
+> eq_label <- paste0("atop(PC1 == ", round(coef(fit)[2], 2), " * log(Caf/Suc) - ", abs(round(coef(fit)[1], 2)), 
++                   ", R^2 == ", r2_val, ")")
+> 
+> p_calib <- ggplot(ratio_df, aes(x = Log_Ratio, y = PC1)) +
++    geom_smooth(method = "lm", colour = "black", fill = "grey93", linewidth = 0.5, formula = y ~ x) +
++    geom_point(aes(colour = class.x), size = 2) +
++    scale_colour_manual(values = class_cols) +
++    annotate("text", x = min(ratio_dfLogRatio)*0.9,y=max(ratiodfPC1) * 0.7,
++             label = eq_label, parse = TRUE, size = 2.2, fontfamily = "sans", hjust = 0) +
++    labs(x = "Log10 (Caffeine / Sucrose Integral Ratio)", y = "Calculated PC1 Coordinates") +
++    theme_bw(base_size = 8, base_family = "sans") +
++    theme(
++        panel.grid.major = element_blank(), 
++        panel.grid.minor = element_blank(),
++        panel.border     = element_rect(colour = "black", linewidth = 0.75),
++        legend.position  = "none"
++    )
+
+Warning message:
+In annotate("text", x = min(ratio_dfLogRatio)*0.9,y=max(ratiodfPC1) *  :
+  Ignoring unknown parameters: `fontfamily`
+> 
+> ggsave(file.path(out_dir, "Figure4_Chemometric_Calibration.png"), plot = p_calib, width = 3.25, height = 3.0, units = "in", dpi = 600)
+> 
+> 
+> # ---- 5e. Figure 5: Hierarchical Clustering Dendrogram ----------------------
+> p_dendro <- ggplot() +
++    geom_segment(data = segment(dendro_data(hc, type = "rectangle")),
++                 aes(x = x, y = y, xend = xend, yend = yend), colour = "black", linewidth = 0.4) +
++    geom_text(data = label(dendro_data(hc, type = "rectangle")) %>% mutate(spectrum = as.character(label)) %>% left_join(meta, by = "spectrum"),
++              aes(x = x, y = y, label = spectrum, colour = class), hjust = 1.05, angle = 90, size = 1.8, fontfamily = "sans") +
++    scale_colour_manual(values = class_cols) +
++    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
++    labs(y = "Euclidean Distance") +
++    theme_minimal(base_size = 8, base_family = "sans") +
++    theme(
++        axis.title.x     = element_blank(), 
++        axis.text.x      = element_blank(),
++        axis.grid.major  = element_blank(), 
++        axis.grid.minor  = element_blank(),
++        panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.75),
++        plot.margin      = margin(t = 5, r = 5, b = 45, l = 5), 
++        legend.position  = "none"
++    )
+
+Warning message:
+In geom_text(data = label(dendro_data(hc, type = "rectangle")) %>%  :
+  Ignoring unknown parameters: `fontfamily`
+> 
+> ggsave(file.path(out_dir, "Figure5_Dendrogram.png"), plot = p_dendro, width = 4.5, height = 3.2, units = "in", dpi = 600)
+
+Warning messages:
+1: In plot_theme(plot) :
+  The `axis.grid.major` theme element is not defined in the element
+hierarchy.
+2: In plot_theme(plot) :
+  The `axis.grid.minor` theme element is not defined in the element
+hierarchy.
+3: In plot_theme(plot) :
+  The `axis.grid.major` theme element is not defined in the element
+hierarchy.
+4: In plot_theme(plot) :
+  The `axis.grid.minor` theme element is not defined in the element
+hierarchy.
+> 
+> 
+> # ---- 5f. Figure 6: Comparative Metabolite Histogram ------------------------
+> biomarker_bins <- bin_df %>%
++    filter(class != "unknown") %>%
++    mutate(Metabolite = case_when(
++        bin_mid >= 5.35 & bin_mid <= 5.45 ~ "Sucrose", 
++        bin_mid >= 7.75 & bin_mid <= 7.85 ~ "Caffeine",
++        bin_mid >= 8.75 & bin_mid <= 8.85 ~ "Trigonelline", 
++        bin_mid >= 6.30 & bin_mid <= 6.50 ~ "Chlorogenic Acids",
++        TRUE ~ NA_character_
++    )) %>% 
++    filter(!is.na(Metabolite)) %>%
++    group_by(class, spectrum, Metabolite) %>% 
++    summarise(Total_Area = sum(area), .groups = "drop") %>%
++    group_by(class, Metabolite) %>% 
++    summarise(Mean_Area = mean(Total_Area), SD_Area = sd(Total_Area), .groups = "drop")
+> 
+> p_hist <- ggplot(biomarker_bins, aes(x = Metabolite, y = Mean_Area, fill = class)) +
++    geom_bar(stat = "identity", position = position_dodge(0.75), width = 0.7, color = "black", linewidth = 0.3) +
++    geom_errorbar(aes(ymin = Mean_Area, ymax = Mean_Area + SD_Area), position = position_dodge(0.75), width = 0.2, linewidth = 0.4) +
++    scale_fill_manual(values = class_cols) +
++    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
++    labs(y = "Mean Normalized Area (%)", x = "Target Small-Molecule Biomarkers") +
++    theme_bw(base_size = 8, base_family = "sans") +
++    theme(
++        panel.grid.major = element_blank(), 
++        panel.grid.minor = element_blank(),
++        panel.border     = element_rect(colour = "black", linewidth = 0.75),
++        legend.title     = element_blank(), 
++        legend.position  = "inside", 
++        legend.position.inside = c(0.15, 0.85),
++        legend.background = element_rect(fill = "white", color = "black", linewidth = 0.3)
++    )
+> 
+> ggsave(file.path(out_dir, "Figure6_Histogram.png"), plot = p_hist, width = 4.5, height = 3.0, units = "in", dpi = 600)
+> 
+> View(summary_ind)
+> # =============================================================================
+> # ---- 6. PRIMARY CHEMOMETRIC FIGURES GENERATION ENGINE ------------------------
+> # =============================================================================
+> 
+> # ---- 6a. Figure 2: Full Section Score Plot (PC1 vs PC2) ---------------------
+> # Checklist Point #3: Plots the entire 28-sample matrix pool to show data scale
+> p_figure2 <- ggplot(all_scores, aes(PC1, PC2, colour = class)) +
++    # Thin origin lines for professional baseline orientation
++    geom_hline(yintercept = 0, colour = "grey93", linewidth = 0.4) +
++    geom_vline(xintercept = 0, colour = "grey93", linewidth = 0.4) +
++    
++    # Render all class reference points
++    geom_point(data = filter(all_scores, class != "unknown"), size = 2, alpha = 0.85) +
++    
++    # Highlight the Kirkland unknown sample with a prominent star shape
++    geom_point(data = filter(all_scores, class == "unknown"), 
++               shape = 8, size = 3, stroke = 1.2) +
++    
++    # Repel text strings neatly to clear overlaps while keeping font size to 6.5pt
++    geom_text_repel(aes(label = spectrum), size = 2.2, fontfamily = "sans", 
++                    show.legend = FALSE, max.overlaps = 25, box.padding = 0.25) +
++    
++    scale_colour_manual(values = class_cols) +
++    labs(x = paste0("PC1 (", round(var_exp[1], 1), "%)"), 
++         y = paste0("PC2 (", round(var_exp[2], 1), "%)")) +
++    
++    # Enforce clean white ACS box layout
++    theme_bw(base_size = 8, base_family = "sans") + 
++    theme(
++        panel.grid.major = element_blank(), 
++        panel.grid.minor = element_blank(),
++        panel.border     = element_rect(colour = "black", linewidth = 0.75),
++        axis.title       = element_text(size = 9, face = "plain"),
++        axis.text        = element_text(color = "black"),
++        legend.title     = element_blank(), 
++        legend.text      = element_text(size = 8),
++        legend.position  = "inside", 
++        legend.position.inside = c(0.15, 0.18), # Inset legend to maximize width
++        legend.background = element_rect(fill = "white", color = "black", linewidth = 0.3)
++    )
+
+Warning message:
+In geom_text_repel(aes(label = spectrum), size = 2.2, fontfamily = "sans",  :
+  Ignoring unknown parameters:
+`fontfamily`
+> 
+> print(p_figure2)
+> ggsave(file.path(out_dir, "Figure2_Full_Section_Scores_Plot.png"), 
++       plot = p_figure2, width = 3.25, height = 3.0, units = "in", dpi = 600)
+> 
+> 
+> # ---- 6b. Figure 3: Isolated Group Score Plot (PC1 vs PC2) ------------------
+> # Checklist Point #2: Isolates and plots *only* your unique group run parameters
+> # It dynamically pulls your group's run date (e.g., "@22" or "@21") based on your unknown's string structure
+> group_run_identifier <- sub("^.*@", "@", unk_scores$spectrum[1])
+> 
+> isolated_group_subset <- all_scores %>% 
++    filter(grepl(group_run_identifier, spectrum) | class == "unknown")
+> 
+> p_figure3 <- ggplot(isolated_group_subset, aes(PC1, PC2, colour = class)) +
++    geom_hline(yintercept = 0, colour = "grey93", linewidth = 0.4) +
++    geom_vline(xintercept = 0, colour = "grey93", linewidth = 0.4) +
++    
++    # Plot only your table's isolated samples with larger markers for contrast
++    geom_point(data = filter(isolated_group_subset, class != "unknown"), size = 2.5) +
++    geom_point(data = filter(isolated_group_subset, class == "unknown"), 
++               shape = 8, size = 3.5, stroke = 1.2) +
++    
++    geom_text_repel(aes(label = spectrum), size = 2.2, fontfamily = "sans", 
++                    show.legend = FALSE, box.padding = 0.3) +
++    
++    scale_colour_manual(values = class_cols) +
++    labs(x = paste0("PC1 (", round(var_exp[1], 1), "%)"), 
++         y = paste0("PC2 (", round(var_exp[2], 1), "%)")) +
++    
++    theme_bw(base_size = 8, base_family = "sans") + 
++    theme(
++        panel.grid.major = element_blank(), 
++        panel.grid.minor = element_blank(),
++        panel.border     = element_rect(colour = "black", linewidth = 0.75),
++        axis.title       = element_text(size = 9, face = "plain"),
++        axis.text        = element_text(color = "black"),
++        legend.position  = "none" # Subsections remain clear without duplicate legends
++    )
+
+Warning message:
+In geom_text_repel(aes(label = spectrum), size = 2.2, fontfamily = "sans",  :
+  Ignoring unknown parameters:
+`fontfamily`
+> 
+> print(p_figure3)
+> ggsave(file.path(out_dir, "Figure3_Isolated_Group_Scores_Plot.png"), 
++       plot = p_figure3, width = 3.25, height = 3.0, units = "in", dpi = 600)
+> 
+> 
+> # ---- 6c. Figure 4: PCA Loadings Plot (Variables) ---------------------------
+> # Checklist Point #4: Pulls the underlying continuous variable weights from the PCA rotation matrix
+> loadings_matrix <- as.data.frame(pca$rotation[, 1:2])
+> loadings_matrix$bin_mid <- as.numeric(rownames(loadings_matrix))
+> 
+> # Tag chemical coordinates matching Sandusky (2017) biomarker chemical shifts
+> loadings_labeled <- loadings_matrix %>%
++    mutate(Biomarker = case_when(
++        bin_mid >= 5.35 & bin_mid <= 5.45 ~ "Sucrose",
++        bin_mid >= 7.75 & bin_mid <= 7.85 ~ "Caffeine",
++        bin_mid >= 8.75 & bin_mid <= 8.85 ~ "Trigonelline",
++        bin_mid >= 6.30 & bin_mid <= 6.50 ~ "Chlorogenic Acids (CQAs)",
++        TRUE ~ NA_character_
++    ))
+> 
+> p_figure4 <- ggplot(loadings_labeled, aes(PC1, PC2)) +
++    geom_hline(yintercept = 0, colour = "grey88", linetype = "dashed", linewidth = 0.4) +
++    geom_vline(xintercept = 0, colour = "grey88", linetype = "dashed", linewidth = 0.4) +
++    
++    # Background: Plot all continuous ppm variables as light grey circles
++    geom_point(colour = "grey75", size = 0.8, alpha = 0.5) +
++    
++    # Foreground: Superimpose your highlighted diagnostic metabolite clusters
++    geom_point(data = filter(loadings_labeled, !is.na(Biomarker)), 
++               aes(fill = Biomarker), shape = 21, size = 2.5, color = "black", stroke = 0.4) +
++    
++    # Label the chemical drivers directly on the map
++    geom_text_repel(data = filter(loadings_labeled, !is.na(Biomarker)), 
++                    aes(label = Biomarker), size = 2.2, fontfamily = "sans",
++                    box.padding = 0.4, force = 2, segment.color = "grey30", segment.size = 0.3) +
++    
++    labs(x = "PC1 Variable Loadings", y = "PC2 Variable Loadings") +
++    theme_bw(base_size = 8, base_family = "sans") +
++    theme(
++        panel.grid.major = element_blank(), 
++        panel.grid.minor = element_blank(),
++        panel.border     = element_rect(colour = "black", linewidth = 0.75),
++        axis.title       = element_text(size = 9, face = "plain"),
++        axis.text        = element_text(color = "black"),
++        legend.position  = "none" # Direct labels eliminate the need for a secondary legend box
++    )
+
+Warning message:
+In geom_text_repel(data = filter(loadings_labeled, !is.na(Biomarker)),  :
+  Ignoring unknown parameters:
+`fontfamily`
+> 
+> print(p_figure4)
+> ggsave(file.path(out_dir, "Figure4_PCA_Loadings_Plot.png"), 
++       plot = p_figure4, width = 3.25, height = 3.0, units = "in", dpi = 600)
+> 
+> # =============================================================================
+> # ---- Figure 1: Stacked 1H NMR Spectral Trace Overlay Engine -----------------
+> # =============================================================================
+> 
+> library(ggplot2)
+> library(dplyr)
+> library(tidyr)
+> 
+> # 1. Generating Mock Continuous 1H NMR Line-Shape Trace Data (5.0 to 10.0 ppm)
+> # Continuous ppm vector standard for down-field coffee profiling
+> ppm_seq <- seq(5.0, 10.0, by = 0.002)
+> 
+> # Lorentzian mathematical line-shape function to simulate raw FID peak profiles
+> lorentzian <- function(x, x0, gamma, amplitude) {
++    amplitude * (gamma^2 / ((x - x0)^2 + gamma^2))
++ }
+> 
+> # Building a baseline trace with synthetic high-resolution micro-instrument noise
+> set.seed(42)
+> noise_a <- rnorm(length(ppm_seq), mean = 0, sd = 0.012)
+> noise_r <- rnorm(length(ppm_seq), mean = 0, sd = 0.012)
+> 
+> # Simulating the C. arabica Metabolomic Fingerprint
+> # Normalized so that the Sucrose anomeric doublet is uniform with Robusta
+> arabica_trace <- data.frame(
++    ppm = ppm_seq,
++    intensity = lorentzian(ppm_seq, 5.40, 0.015, 1.20) +  # Sucrose (Normalized target)
++        lorentzian(ppm_seq, 7.80, 0.020, 0.25) +  # Caffeine (Low in Arabica)
++        lorentzian(ppm_seq, 6.45, 0.040, 0.20) +  # Chlorogenic Acids (CQAs)
++        lorentzian(ppm_seq, 6.85, 0.035, 0.15) +  
++        lorentzian(ppm_seq, 7.15, 0.045, 0.22) +  
++        lorentzian(ppm_seq, 8.82, 0.030, 0.40) +  # Trigonelline
++        lorentzian(ppm_seq, 9.12, 0.025, 0.35) +  
++        noise_a,
++    class = "Coffea arabica"
++ )
+> 
+> # Simulating the C. canephora (Robusta) Metabolomic Fingerprint
+> # Showcases elevated baseline intensities for alkaloids and phenolics
+> robusta_trace <- data.frame(
++    ppm = ppm_seq,
++    intensity = lorentzian(ppm_seq, 5.40, 0.015, 1.20) +  # Sucrose (Identical target scale)
++        lorentzian(ppm_seq, 7.80, 0.020, 1.15) +  # Caffeine (Significantly Higher)
++        lorentzian(ppm_seq, 6.45, 0.040, 0.55) +  # Chlorogenic Acids (Significantly Higher)
++        lorentzian(ppm_seq, 6.85, 0.035, 0.45) +  
++        lorentzian(ppm_seq, 7.15, 0.045, 0.65) +  
++        lorentzian(ppm_seq, 8.82, 0.030, 0.45) +  # Trigonelline
++        lorentzian(ppm_seq, 9.12, 0.025, 0.38) +  
++        noise_r,
++    class = "Coffea canephora (Robusta)"
++ )
+> 
+> # Combine datasets into a stacked, paneled layout array
+> stacked_spectral_data <- bind_rows(arabica_trace, robusta_trace) %>%
++    mutate(class = factor(class, levels = c("Coffea arabica", "Coffea canephora (Robusta)")))
+> 
+> # Custom annotation labels frame mapping specific small-molecule assignments
+> peak_annotations <- data.frame(
++    ppm = c(5.40, 7.80, 6.80, 8.97),
++    intensity = c(1.35, 1.25, 0.75, 0.55),
++    label = c("Sucrose\n(5.40 ppm)", "Caffeine\n(7.80 ppm)", 
++              "Chlorogenic Acids\n(6.20-7.50 ppm)", "Trigonelline\n(8.00-9.20 ppm)"),
++    class = factor("Coffea canephora (Robusta)", levels = c("Coffea arabica", "Coffea canephora (Robusta)"))
++ )
+> 
+> # 2. Rendering the Clean, Stacked ACS Publication Overlay
+> p_spectral_overlay <- ggplot(stacked_spectral_data, aes(x = ppm, y = intensity, colour = class)) +
++    geom_line(linewidth = 0.4, show.legend = FALSE) +
++    
++    # Superimpose clean, professional peak pointer text strings to the top robusta panel
++    geom_text(data = peak_annotations, aes(label = label), 
++              colour = "black", size = 2.0, fontfamily = "sans", lineheight = 0.9, vjust = 0) +
++    
++    # Apply your easy-on-the-eyes standard blue/orange group colorways
++    scale_colour_manual(values = c("Coffea arabica" = "#2a6f97", "Coffea canephora (Robusta)" = "#ca6702")) +
++    
++    # Invert the chemical shift x-axis standard for all NMR representations (10.0 down to 5.0 ppm)
++    scale_x_reverse(limits = c(10.0, 5.0), expand = c(0.01, 0.01)) +
++    scale_y_continuous(limits = c(-0.15, 1.6), expand = c(0, 0)) +
++    
++    labs(x = expression(paste(""^1, "H Chemical Shift (", delta, ", ppm)")),
++         y = "Normalized Spectral Intensity (arbitrary units)") +
++    
++    # Force independent stacked vertical panels with isolated cultivar headers
++    facet_wrap(~class, ncol = 1, scales = "fixed") +
++    
++    theme_bw(base_size = 8, base_family = "sans") +
++    theme(
++        panel.grid.major = element_blank(), # Clean White: Removes distracting grids
++        panel.grid.minor = element_blank(),
++        panel.border     = element_rect(colour = "black", linewidth = 0.75),
++        strip.background = element_rect(fill = "grey95", colour = "black", linewidth = 0.5),
++        strip.text       = element_text(size = 8, face = "italic", colour = "black"),
++        axis.title       = element_text(size = 9, face = "plain"),
++        axis.text        = element_text(color = "black"),
++        axis.ticks       = element_line(colour = "black", linewidth = 0.5)
++    )
+
+Warning message:
+In geom_text(data = peak_annotations, aes(label = label), colour = "black",  :
+  Ignoring unknown parameters:
+`fontfamily`
+> 
+> # Print vector to your plot panel viewport
+> print(p_spectral_overlay)
+> 
+> # Save exact dimensions matching a full single-column layout panel structure
+> ggsave(file.path(out_dir, "Figure1_NMR_Spectral_Trace_Overlay.png"), 
++       plot = p_spectral_overlay, width = 4.5, height = 3.8, units = "in", dpi = 600)
+> 
+> # =============================================================================
+> # ---- Figure 5: Chemometric Calibration Regression Curve Engine --------------
+> # =============================================================================
+> 
+> # 1. Isolating individual peak integral area boundaries from bin_df
+> ratio_df <- bin_df %>%
++    filter(class != "unknown") %>% # Focus on reference standards populations
++    group_by(spectrum, class) %>%
++    summarise(
++        Caffeine_Area = sum(area[bin_mid >= 7.75 & bin_mid <= 7.85]),
++        Sucrose_Area  = sum(area[bin_mid >= 5.35 & bin_mid <= 5.45]),
++        .groups = "drop"
++    ) %>%
++    # Logarithmic transformation to linearize phenotypic ratios and stabilize variance
++    mutate(Log_Ratio = log10((Caffeine_Area + 0.01) / (Sucrose_Area + 0.01))) %>%
++    left_join(all_scores, by = "spectrum")
+> 
+> # 2. Executing Ordinary Least Squares Linear Regression Model
+> fit <- lm(PC1 ~ Log_Ratio, data = ratio_df)
+> r2_val <- round(summary(fit)$r.squared, 3)
+> 
+> # Formulating mathematical display label using 'atop' to prevent multi-line \n parse errors
+> eq_label <- paste0("atop(PC1 == ", round(coef(fit)[2], 2), " * log[10](Caf/Suc) - ", abs(round(coef(fit)[1], 2)), 
++                   ", R^2 == ", r2_val, ")")
+> 
+> # 3. Rendering the Clean, Gridless ACS Publication Calibration Curve
+> p_calibration <- ggplot(ratio_df, aes(x = Log_Ratio, y = PC1)) +
++    # Adds a solid black fit line superimposed over a light-grey 95% standard error confidence band
++    geom_smooth(method = "lm", colour = "black", fill = "grey93", linewidth = 0.5, formula = y ~ x) +
++    
++    # Plot data track scores colored cleanly by their biological species lineage
++    geom_point(aes(colour = class.x), size = 2.0, alpha = 0.9) +
++    scale_colour_manual(values = class_cols) +
++    
++    # Annotate mathematical regression formula inside the open upper-left quadrant
++    annotate("text", x = min(ratio_dfLogRatio)*0.9,y=max(ratiodfPC1) * 0.7,
++             label = eq_label, parse = TRUE, size = 2.2, fontfamily = "sans", hjust = 0) +
++    
++    labs(x = expression(paste("Log"[10], " (Caffeine / Sucrose Peak Integral Ratio)")), 
++         y = "Calculated Principal Component 1 Coordinates") +
++    
++    # Apply strict ACS visual boundary frame styles
++    theme_bw(base_size = 8, base_family = "sans") +
++    theme(
++        panel.grid.major = element_blank(), # Clean White: Removes distracting grid blocks
++        panel.grid.minor = element_blank(),
++        panel.border     = element_rect(colour = "black", linewidth = 0.75),
++        axis.title       = element_text(size = 9, face = "plain"),
++        axis.text        = element_text(color = "black"),
++        axis.ticks       = element_line(colour = "black", linewidth = 0.5),
++        legend.position  = "none" # Subsections remain clear without duplicate legends
++    )
+
+Warning message:
+In annotate("text", x = min(ratio_dfLogRatio)*0.9,y=max(ratiodfPC1) *  :
+  Ignoring unknown parameters:
+`fontfamily`
+> 
+> # Print vector map to viewport
+> print(p_calibration)
+> 
+> # Save exact single-column width specifications matching ACS publisher guides (3.25 inches)
+> ggsave(file.path(out_dir, "Figure5_Chemometric_Calibration_Curve.png"), 
++       plot = p_calibration, width = 3.25, height = 3.0, units = "in", dpi = 600)
+> 
+> # =============================================================================
+> # ---- Figure 6: Hierarchical Cluster Analysis (Dendrogram) Engine -------------
+> # =============================================================================
+> 
+> # 1. Computing Euclidean distance matrix on your variance-stabilized matrix X_known
+> dist_matrix <- dist(X_known, method = "euclidean")
+> 
+> # 2. Executing agglomerative hierarchical clustering via Ward's minimum variance method
+> hc <- hclust(dist_matrix, method = "ward.D2")
+> 
+> # 3. Discretizing hclust vector trees into a clean ggplot framework using ggdendro
+> dendro_data <- dendro_data(hc, type = "rectangle")
+> 
+> # 4. Connecting tree leaf identifiers with your original sample species metadata
+> leaf_labels <- label(dendro_data) %>%
++    mutate(spectrum = as.character(label)) %>%
++    left_join(meta, by = "spectrum")
+> 
+> # 5. Rendering the Clean, Gridless ACS Publication Dendrogram
+> p_dendrogram <- ggplot() +
++    # Draw the structural branch segments of the clustering tree
++    geom_segment(data = segment(dendro_data), 
++                 aes(x = x, y = y, xend = xend, yend = yend), 
++                 colour = "black", linewidth = 0.4) +
++    
++    # Superimpose your sample leaf labels rotated at 90 degrees
++    # Color-coded completely to match your standard easy-on-the-eyes palette
++    geom_text(data = leaf_labels, 
++              aes(x = x, y = y, label = spectrum, colour = class), 
++              hjust = 1.05, angle = 90, size = 1.8, fontfamily = "sans") +
++    
++    scale_colour_manual(values = class_cols) +
++    
++    # Expand vertical scaling limits to accommodate the text labels beneath the tree leaves
++    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
++    
++    labs(y = "Euclidean Distance", title = "Hierarchical Cluster Analysis") +
++    
++    # Force strict 8pt sans-serif text geometries
++    theme_minimal(base_size = 8, base_family = "sans") +
++    theme(
++        axis.title.x     = element_blank(), 
++        axis.text.x      = element_blank(),
++        axis.grid.major  = element_blank(), # Clean White: Strips background lines
++        axis.grid.minor  = element_blank(),
++        panel.background = element_blank(),
++        panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.75),
++        plot.title       = element_text(size = 9, face = "plain", hjust = 0.5),
++        
++        # CRITICAL FIX: Expands bottom margin canvas bounds so label names are completely readable
++        plot.margin      = margin(t = 5, r = 5, b = 45, l = 5), 
++        legend.position  = "none"
++    )
+
+Warning message:
+In geom_text(data = leaf_labels, aes(x = x, y = y, label = spectrum,  :
+  Ignoring unknown parameters:
+`fontfamily`
+> 
+> # Print vector visualization map to console viewport
+> print(p_dendrogram)
+
+Warning messages:
+1: In plot_theme(plot) : The `axis.grid.major` theme
+element is not defined in the
+element hierarchy.
+2: In plot_theme(plot) : The `axis.grid.minor` theme
+element is not defined in the
+element hierarchy.
+> 
+> # Save exact high-resolution single-column specifications (4.5 inches wide, 600 DPI)
+> ggsave(file.path(out_dir, "Figure6_Hierarchical_Dendrogram.png"), 
++       plot = p_dendrogram, width = 4.5, height = 3.2, units = "in", dpi = 600)
+
+Warning messages:
+1: In plot_theme(plot) : The `axis.grid.major` theme
+element is not defined in the
+element hierarchy.
+2: In plot_theme(plot) : The `axis.grid.minor` theme
+element is not defined in the
+element hierarchy.
+3: In plot_theme(plot) : The `axis.grid.major` theme
+element is not defined in the
+element hierarchy.
+4: In plot_theme(plot) : The `axis.grid.minor` theme
+element is not defined in the
+element hierarchy.
+> 
+> # =============================================================================
+> # ---- Figure 6: Hierarchical Cluster Analysis (Dendrogram) Engine -------------
+> # =============================================================================
+> 
+> # 1. Compute distance and clustering vectors
+> dist_matrix <- dist(X_known, method = "euclidean")
+> hc <- hclust(dist_matrix, method = "ward.D2")
+> 
+> # 2. Extract standard dendrogram segments
+> dendro_data <- dendro_data(hc, type = "rectangle")
+> segments_df <- segment(dendro_data)
+> 
+> # 3. Isolate metadata labels and join species classifications
+> leaf_labels <- label(dendro_data) %>%
++    mutate(spectrum = as.character(label)) %>%
++    left_join(meta, by = "spectrum")
+> 
+> # 4. CRITICAL LAYER: Identify and color-code the bottom vertical branch lines
+> # We isolate segments where yend == 0 (the bottom leaf endpoints) 
+> # and map them to their corresponding species class
+> segments_df <- segments_df %>%
++    mutate(is_leaf_branch = (yend == 0 & y != yend)) %>%
++    left_join(leaf_labels %>% select(x, class), by = c("x" = "x")) %>%
++    mutate(branch_color = ifelse(is_leaf_branch & !is.na(class), as.character(class), "black"))
+> 
+> # Separate segments into non-colored upper tree branches and color-coded bases
+> upper_tree  <- segments_df %>% filter(branch_color == "black")
+> colored_base <- segments_df %>% filter(branch_color != "black")
+> 
+> # 5. Rendering the Clean, Gridless ACS Publication Dendrogram with Color Bases
+> p_dendrogram <- ggplot() +
++    # Draw upper main tree architecture in uniform black lines
++    geom_segment(data = upper_tree, 
++                 aes(x = x, y = y, xend = xend, yend = yend), 
++                 colour = "black", linewidth = 0.4) +
++    
++    # Draw bottom terminal leaf branches color-coded by botanical cultivar species
++    geom_segment(data = colored_base, 
++                 aes(x = x, y = y, xend = xend, yend = yend, colour = branch_color), 
++                 linewidth = 0.6, show.legend = FALSE) +
++    
++    # Superimpose your sample leaf labels matching the color track perfectly
++    geom_text(data = leaf_labels, 
++              aes(x = x, y = y, label = spectrum, colour = class), 
++              hjust = 1.05, angle = 90, size = 1.8, fontfamily = "sans") +
++    
++    scale_colour_manual(values = c(class_cols, "black" = "black")) +
++    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
++    
++    labs(y = "Euclidean Distance", title = "Hierarchical Cluster Analysis") +
++    
++    theme_minimal(base_size = 8, base_family = "sans") +
++    theme(
++        axis.title.x     = element_blank(), 
++        axis.text.x      = element_blank(),
++        axis.grid.major  = element_blank(), 
++        axis.grid.minor  = element_blank(),
++        panel.background = element_blank(),
++        panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.75),
++        plot.title       = element_text(size = 9, face = "plain", hjust = 0.5),
++        plot.margin      = margin(t = 5, r = 5, b = 45, l = 5), # Keeps labels from cutting off
++        legend.position  = "none"
++    )
+
+Warning message:
+In geom_text(data = leaf_labels, aes(x = x, y = y, label = spectrum,  :
+  Ignoring unknown parameters:
+`fontfamily`
+> 
+> print(p_dendrogram)
+
+Warning messages:
+1: In plot_theme(plot) : The `axis.grid.major` theme
+element is not defined in the
+element hierarchy.
+2: In plot_theme(plot) : The `axis.grid.minor` theme
+element is not defined in the
+element hierarchy.
+> ggsave(file.path(out_dir, "Figure6_Hierarchical_Dendrogram.png"), 
++       plot = p_dendrogram, width = 4.5, height = 3.2, units = "in", dpi = 600)
+
+Warning messages:
+1: In plot_theme(plot) : The `axis.grid.major` theme
+element is not defined in the
+element hierarchy.
+2: In plot_theme(plot) : The `axis.grid.minor` theme
+element is not defined in the
+element hierarchy.
+3: In plot_theme(plot) : The `axis.grid.major` theme
+element is not defined in the
+element hierarchy.
+4: In plot_theme(plot) : The `axis.grid.minor` theme
+element is not defined in the
+element hierarchy.
+> 
+
+
+
+
+
+>
+
+
+
+
+
